@@ -5,5 +5,5 @@ EXPOSE 8080
 RUN useradd -m kubernetes
 USER kubernetes
 WORKDIR /home/kubernetes/
-COPY --chown=kubernetes spring-petclinic-$SPC_VERSION.jar /home/kubernetes/spring-petclinic-$SPC_VERSION.jar
+COPY --chown=kubernetes /home/vsts/work/1/s/target/spring-petclinic-$SPC_VERSION.jar /home/kubernetes/spring-petclinic-$SPC_VERSION.jar
 CMD ["java", "-jar", "/home/kubernetes/spring-petclinic-$SPC_VERSION.jar"]
