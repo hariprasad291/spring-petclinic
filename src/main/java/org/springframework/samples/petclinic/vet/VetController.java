@@ -37,8 +37,8 @@ class VetController {
 
 	private final VetRepository vetRepository;
 
-	public VetController(VetRepository clinicService) {
-		this.vetRepository = clinicService;
+	public VetController(VetRepository vetRepository) {
+		this.vetRepository = vetRepository;
 	}
 
 	@GetMapping("/vets.html")
@@ -49,7 +49,6 @@ class VetController {
 		Page<Vet> paginated = findPaginated(page);
 		vets.getVetList().addAll(paginated.toList());
 		return addPaginationModel(page, paginated, model);
-
 	}
 
 	private String addPaginationModel(int page, Page<Vet> paginated, Model model) {

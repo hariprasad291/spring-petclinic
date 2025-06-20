@@ -1,0 +1,115 @@
+stages:
+  - code_scan
+  - build
+  - docker
+  - deploy
+  - rollback
+
+variables:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: spring-petclinic
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  EKS_CLUSTER: my-eks-cluster
+  HELM_RELEASE: spring-petclinic
+  NAMESPACE: dev
+
+# code_scan:
+#   stage: code_scan
+#   image: 
+#     name: aquasec/trivy:0.49.1
+#     entrypoint: [""]
+#   script:
+#     - trivy version
+#     - trivy secrest --severity HIGH,CRITICAL --format table . || true #--exit-code 0 --no-progress --format json --output trivy-secrets-report.json .
+#     - trivy config --severity HIGH,CRITICAL --format table . || true #--exit-code 0 --no-progress --format json --output trivy-config-report.json .
+#   artifacts:
+#     paths:  
+#       - trivy-config-report.json
+#       - trivy-secrets-report.json
+#     expire_in: 1 week
+
+build:
+  stage: build
+  image: maven:3.9.4-eclipse-temurin-17
+  script:
+    - ./mvnw package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+
+docker:
+  stage: docker
+  image: docker:stable
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+  dependencies:
+    - build
+  before_script:
+    - apk update && apk add --no-cache curl python3 py3-pip aws-cli bash jq
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - export TRIVY_VERSION=$(wget -qO - "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo $TRIVY_VERSION
+    - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
+  script:
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+    #- docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+    - docker run -d --name petclinic $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+    - ./trivy fs --container petclinic --exit-code 0 --severity HIGH,CRITICAL
+  #   - ./trivy image --exit-code 0 --format template --template "@contrib/gitlab-codequality.tpl" -o gl-codeclimate-image.json $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+  #   # Filesystem report
+  #   - ./trivy filesystem --scanners misconfig,vuln --exit-code 0 --format template --template "@contrib/gitlab-codequality.tpl" -o gl-codeclimate-fs.json .
+  #   #Secrets scanning
+  #   - ./trivy filesystem --scanners secret --exit-code 0 --format template --template "@contrib/gitlab-codequality.tpl" -o gl-codeclimate-fs-secrets.json .
+  #   # Combine report
+  #   - jq -s 'add' gl-codeclimate-image.json gl-codeclimate-fs.json gl-codeclimate-fs-secrets.json > gl-codeclimate.json
+  # cache:
+  #   paths:
+  #     - .trivycache/
+  # # Enables https://docs.gitlab.com/ee/user/application_security/container_scanning/ (Container Scanning report is available on GitLab EE Ultimate or GitLab.com Gold)
+  # artifacts:
+  #   paths:
+  #     - gl-codeclimate.json
+
+deploy:
+  stage: deploy
+  image: ubuntu:22.04
+  before_script:
+    - apt update && apt install -y curl unzip openssl bash
+    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    - unzip awscliv2.zip && ./aws/install
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  script: 
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+    - helm upgrade --install "$HELM_RELEASE" ./helm/spring-petclinic-chart --namespace "$NAMESPACE" --create-namespace --set image.repository="$ECR_REGISTRY/$ECR_REPOSITORY" --set image.tag="$IMAGE_TAG"
+    #- kubectl rollout status deployment/$HELM_RELEASE --namespace $NAMESPACE --timeout=60s
+
+rollback:
+  stage: rollback
+  image: ubuntu:22.04
+  before_script:
+    - apt update && apt install -y curl unzip openssl bash jq
+    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    - unzip awscliv2.zip && ./aws/install
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  script: 
+    - echo "Rolling back to last successful Helm release Version for the release $HELM_RELEASE"
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+    - PREV_REV=$(helm history $HELM_RELEASE --namespace $NAMESPACE -o json | jq '[.[] | select(.status == "deployed")][length-2].revision')
+    - echo "Rolling backt to revision $PREV_REV"
+    - helm rollback $HELM_RELEASE $PREV_REV --namespace $NAMESPACE
+    - kubectl rollout status deployment/$HELM_RELEASE --namespace $NAMESPACE --timeout=60s
+  when: on_failure
+  allow_failure: true
+  needs: ["deploy"]
